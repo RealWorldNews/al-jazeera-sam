@@ -1,20 +1,25 @@
 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = 1;
 const chromium = process.env.AWS_EXECUTION_ENV ? require('@sparticuz/chromium') : null;
 const puppeteer = require('puppeteer');
+const fs = require('fs');
 const { Client } = require('pg');
 const cuid = require('cuid');
 require('dotenv').config();
 
-const processBody = (body, link, resource = 'NPR') => {
+const processBody = (body, link, resource = 'Al Jazeera') => {
   let formattedBody = '';
-
   if (body) {
-    formattedBody += `<p>${body}</p><br><br><ul><li><a href='${link}'>Visit ${resource}</a></li></ul>`;
-  } else if (link) {
-    formattedBody += `<br><br><ul><li><a href='${link}'>Visit article @ ${resource}</a></li></ul>`;
+    formattedBody += body; // Retain the body content as extracted, with all formatting
   }
-
+  formattedBody += `<br><br><ul><li><a href='${link}'>Visit ${resource}</a></li></ul>`;
   return formattedBody;
+};
+
+// Function to remove HTML tags from a string
+const stripHtml = (html) => {
+  const tempDiv = document.createElement('div');
+  tempDiv.innerHTML = html;
+  return tempDiv.textContent || tempDiv.innerText || '';
 };
 
 const insertArticleIntoDatabase = async (client, article) => {
@@ -37,26 +42,20 @@ const insertArticleIntoDatabase = async (client, article) => {
 };
 
 exports.handler = async (event, context) => {
-  const websiteUrl = event.url || 'https://www.npr.org/sections/news/'; // Use the NPR News URL directly or pass via event
-
-  if (!websiteUrl) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify('URL is required')
-    };
-  }
+  const websiteUrl = 'https://www.aljazeera.com'; // Al Jazeera URL
 
   const client = new Client({
     connectionString: process.env.POSTGRES_CONNECTION_STRING_DEV
   });
 
   console.log('Connecting to the database...');
+  let result;
   try {
     await client.connect();
     console.log('Connected to the database successfully.');
 
-    await client.query('DELETE FROM "Article" WHERE resource = $1', ['NPR']);
-    console.log('Truncated existing articles with resource "NPR".');
+    await client.query('DELETE FROM "Article" WHERE resource = $1', ['Al Jazeera']);
+    console.log('Truncated existing articles with resource "Al Jazeera".');
 
     const browser = await puppeteer.launch({
       args: chromium ? chromium.args : [],
@@ -67,154 +66,189 @@ exports.handler = async (event, context) => {
     });
 
     const page = await browser.newPage();
-    console.log('Navigating to NPR News section...');
+    console.log('Navigating to Al Jazeera website...');
     try {
-      await page.goto(websiteUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 6000
-      });
+      await page.goto(websiteUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
       console.log('Page loaded successfully');
-    } catch (error) {
-      console.error('Failed to load NPR News page:', error);
-      await browser.close();
-      await client.end();
-      return {
-        statusCode: 500,
-        body: JSON.stringify('Failed to load the website')
-      };
-    }
 
-    // Scrape the articles
-    const articlesData = await page.$$eval('.item', items =>
-      items.map(item => ({
-        headline: item.querySelector('.title a')?.innerText.trim(),
-        link: item.querySelector('.title a')?.href.trim(),
-        date: item.querySelector('.teaser time')?.getAttribute('datetime').trim()
-      }))
-    );
-    
-    const articles = articlesData.map(data => {
-
-      let formattedDate = data.date;
-      if (formattedDate.length === 19) { 
-        formattedDate += '.000'; 
+      const cookieButtonSelector = '#onetrust-accept-btn-handler';
+      if (await page.$(cookieButtonSelector)) {
+        console.log('Cookie consent banner found, clicking "Allow all"...');
+        await page.click(cookieButtonSelector);
       }
 
-      const baseSlug = data.headline.split(' ').slice(0, 3).join('').toLowerCase().replace(/[^a-z]/g, '');
-    
-      const randomNum = Math.floor(Math.random() * 2000) + 1;
-    
-      return {
-        id: cuid(),
-        headline: data.headline,
-        link: data.link,
-        date: formattedDate,
-        slug: `${baseSlug}-${randomNum}`, // Append random number to the slug
-        resource: 'NPR',
-        summary: '',
-        body: '',
-        author: '',
-        media: ''
-      };
-    });
-    
+      console.log('Scrolling down to find the trending articles section...');
+      let trendingArticlesFound = false;
 
+      while (!trendingArticlesFound) {
+        trendingArticlesFound = (await page.$('.trending-articles')) !== null;
+        if (!trendingArticlesFound) {
+          console.log('Scrolling down...');
+          await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+          await page.waitForTimeout(1000);
+        }
+      }
 
-    for (const article of articles) {
+      console.log('Trending articles section found.');
+      
+      const articles = await page.$$eval('.trending-articles__list li', items =>
+        items.map(item => {
+          const headline = item.querySelector('.article-trending__title span')?.innerText.trim();
+          const link = 'https://www.aljazeera.com' + item.querySelector('.article-trending__title-link')?.getAttribute('href').trim();
+          const slug = headline.split(' ').slice(0, 3).join('').toLowerCase().replace(/[^a-z]/g, '');
+          return { headline, link, slug };
+        })
+      );
 
-      let success = false;
-      let attempts = 0;
-      const maxAttempts = 3;
+      console.log('Collected headlines and links:', articles);
 
-      while (!success && attempts < maxAttempts) {
-        attempts++;
-        try {
-          await page.goto(article.link, {
-            waitUntil: 'networkidle0',
-            timeout: 30000
-          });
+      for (const article of articles) {
+        console.log(`Visiting article: ${article.headline}`);
+        let success = false;
+        let attempts = 0;
 
+        while (!success && attempts < 3) {
+          attempts++;
           try {
-            const media = await page.$eval(
-              'div.imagewrap.has-source-dimensions picture img',
-              img => img.getAttribute('src')
-            );
-            article.media = media;
-          } catch (error) {
-            console.error('Error finding media content: ', error);
-            article.media = '';
-          }
+            await page.goto(article.link, { waitUntil: 'domcontentloaded', timeout: 10000 });
 
-          try {
-            const bodyContent = await page.$$eval('#storytext p', paragraphs =>
-              paragraphs.map(p => p.innerText.trim()).join('\n\n')
-            );
-
-            article.summary = bodyContent.split(' ').slice(0, 25).join(' ') + '...';
-            article.body = processBody(bodyContent, article.link);
-          } catch (err) {
-            console.error('Error finding body content: ', err);
-            article.summary = '';
-            article.body = '';
-          }
-
-          try {
-            const author = await page.$eval('.byline__name a', name =>
-              name.innerText.trim()
-            );
-            article.author = author;
-          } catch (err) {
+            // Extract body
             try {
-              const author = await page.$eval(
-                '.byline__name.byline__name--block',
-                name => name.innerText.trim()
-              );
-              article.author = author;
+              article.body = await page.$eval('div.wysiwyg, div.wysiwyg--all-content', el => {
+                const elementsToRemove = ['.more-on', '.sib-newsletter-form', '.advertisement', '.ad-container', '.widget'];
+                
+                // Remove unwanted elements like ads, newsletter forms, etc.
+                elementsToRemove.forEach(selector => {
+                  const elements = el.querySelectorAll(selector);
+                  elements.forEach(element => element.remove());
+                });
+                
+                // Capture all content including <h2>, <p>, and <img> tags
+                let bodyContent = '';
+                
+                el.querySelectorAll('h2, p, img').forEach(node => {
+                  if (node.nodeName === 'IMG') {
+                    const imgSrc = node.getAttribute('src');
+                    const imgAlt = node.getAttribute('alt') || '';
+                    bodyContent += `<figure><img src="${imgSrc}" alt="${imgAlt}"/><figcaption>${imgAlt}</figcaption></figure>`;
+                  } else {
+                    bodyContent += `<${node.nodeName.toLowerCase()}>${node.innerText.trim()}</${node.nodeName.toLowerCase()}>`;
+                  }
+                });
+                
+                return bodyContent;
+              });
+            } catch (err) {
+              console.error('Error extracting full body content:', err);
+              article.body = '';
+            }
+            
+            article.body = processBody(article.body, article.link);
+            
+            // Extract and clean the summary
+            try {
+              article.summary = await page.$eval('#wysiwyg li', el => el.innerText.split(' ').slice(0, 40).join(' '));
             } catch (err) {
               try {
-                const author = await page.$eval('.byline__name', element =>
-                  element.innerText.trim()
-                );
-                article.author = author;
+                article.summary = await page.$eval('.article__subhead em', el => el.innerText.trim());
               } catch (err) {
-                console.error('Error finding author: ', err);
-                article.author = 'See article for details';
+                try {
+                  article.summary = await page.$eval('#wysiwyg p', el => el.innerText.split(' ').slice(0, 40).join(' ').trim());
+                } catch (err) {
+                  article.summary = ''; 
+                }
               }
             }
-          }
+            
+            // If no summary, strip HTML from the body and use first 25 words
+            if (!article.summary || article.summary.length === 0) {
+              article.summary = stripHtml(article.body.split(' ').slice(0, 25).join(' ') + '...');
+            }
 
-          await insertArticleIntoDatabase(client, article);
+            console.log("summary", article.summary);
 
-          success = true;
-          console.log(`Collected and saved data for article: ${article.headline}`);
-        } catch (error) {
-          console.error(
-            `Error processing article: ${article.headline}, attempt ${attempts}`,
-            error
-          );
-          if (attempts >= maxAttempts) {
-            console.error(`Failed to load article after ${maxAttempts} attempts.`);
+            try {
+              article.author = await page.$eval('.article-author-name-item a.author-link', el => el?.innerText.trim());
+            } catch (err) {
+              article.author = 'See article for details';
+            }
+
+            try {
+              article.media = await extractMainImage(page);
+            } catch (err) {
+              article.media = 'https://upload.wikimedia.org/wikipedia/en/thumb/8/8f/Al_Jazeera_Media_Network_Logo.svg/1200px-Al_Jazeera_Media_Network_Logo.svg.png';
+            }
+
+            try {
+              const rawDate = await page.$eval('.date-simple span[aria-hidden="true"]', el => el?.innerText.trim());
+              const date = new Date(rawDate);
+              article.date = date.toISOString();
+            } catch (err) {
+              article.date = '';
+            }
+
+            article.resource = 'Al Jazeera';
+            article.id = cuid();
+
+            // Insert into the database
+            await insertArticleIntoDatabase(client, article);
+            success = true;
+          } catch (error) {
+            if (attempts >= 3) {
+              console.error(`Failed to load article after 3 attempts: ${article.headline}`);
+            }
           }
         }
       }
+
+      fs.writeFileSync('enriched-articles.json', JSON.stringify(articles, null, 2));
+      await browser.close();
+      
+      result = {
+        statusCode: 200,
+        body: JSON.stringify({
+          message: 'Scraping completed successfully',
+          articles
+        })
+      };
+    } catch (error) {
+      console.error('Error:', error);
+      result = { statusCode: 500, body: 'Scraping failed' };
+    } finally {
+      await client.end();
+      console.log('Database connection closed.');
     }
-
-    await browser.close();
-
-    const response = {
-      statusCode: 200,
-      body: JSON.stringify({ message: 'Scraping completed successfully', articles }),
-    };
-
-    return response;
   } catch (error) {
-    console.error('Error:', error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify('An error occurred during scraping'),
-    };
-  } finally {
-    await client.end();
-    console.log('Database connection closed.');
+    console.error('Error connecting to the database:', error);
+    result = { statusCode: 500, body: 'Database connection failed' };
   }
+
+  return result;  // Return the result for Lambda response
 };
+
+// Function to extract the main image
+async function extractMainImage(page) {
+  try {
+    const mediaSelector1 = '.featured-media__image-wrap img';
+    let imageUrl = await page.$eval(mediaSelector1, img => img.src);
+
+    if (!imageUrl.startsWith('http')) {
+      imageUrl = 'https://www.aljazeera.com' + imageUrl;
+    }
+    
+    return imageUrl;
+  } catch (error1) {
+    try {
+      const mediaSelector2 = 'figure.article-featured-image div.responsive-image img';
+      let imageUrl = await page.$eval(mediaSelector2, img => img.src);
+
+      if (!imageUrl.startsWith('http')) {
+        imageUrl = 'https://www.aljazeera.com' + imageUrl;
+      }
+
+      return imageUrl;
+    } catch (error2) {
+      return 'https://upload.wikimedia.org/wikipedia/en/thumb/8/8f/Al_Jazeera_Media_Network_Logo.svg/1200px-Al_Jazeera_Media_Network_Logo.svg.png';
+    }
+  }
+}
