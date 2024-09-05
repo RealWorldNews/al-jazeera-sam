@@ -1,7 +1,6 @@
 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = 1;
 const chromium = process.env.AWS_EXECUTION_ENV ? require('@sparticuz/chromium') : null;
 const puppeteer = require('puppeteer');
-const fs = require('fs');
 const { Client } = require('pg');
 const cuid = require('cuid');
 require('dotenv').config();
@@ -201,7 +200,6 @@ exports.handler = async (event, context) => {
         }
       }
 
-      fs.writeFileSync('enriched-articles.json', JSON.stringify(articles, null, 2));
       await browser.close();
       
       result = {
